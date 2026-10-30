@@ -1,0 +1,68 @@
+name: Publish ITAYOS installers
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Installer version (X.Y.Z)
+        required: true
+        default: '1.2.0'
+permissions:
+  contents: write
+concurrency:
+  group: itayos-release-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify installers and publish the prepared release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          export RELEASE_DIR="releases/$VERSION"
+          main="$RELEASE_DIR/ITAYOS.Setup.$VERSION.exe"
+          mod="$RELEASE_DIR/ITAYOS.Mod.Setup.$VERSION.exe"
+          test -f "$main" && test -f "$mod" && test -f "$RELEASE_DIR/notes.md"
+          node <<'NODE'
+          const fs = require('fs'), crypto = require('crypto');
+          const version = process.env.VERSION, dir = process.env.RELEASE_DIR, repo = process.env.GH_REPO;
+          const manifest = { version, date: new Date().toISOString(), notes: fs.readFileSync(dir + '/notes.md', 'utf8') };
+          for (const kind of ['main', 'mod']) {
+            const name = `ITAYOS.${kind === 'mod' ? 'Mod.' : ''}Setup.${version}.exe`;
+            const bytes = fs.readFileSync(dir + '/' + name);
+            if (bytes.length < 102400 || bytes.toString('ascii', 0, 2) !== 'MZ') throw new Error('Invalid installer');
+            manifest[kind] = { url: `https://github.com/${repo}/releases/download/v${version}/${name}`, name, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
+          }
+          fs.writeFileSync(dir + '/latest.json', JSON.stringify(manifest, null, 2));
+          NODE
+          tag="v$VERSION"
+          existing="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name==\"$tag\") | [.id,.draft] | @tsv")"
+          if [[ -z "$existing" ]]; then
+            gh release create "$tag" --draft --title "ITAYOS $VERSION" --notes-file "$RELEASE_DIR/notes.md"
+          elif [[ "$existing" != *$'\ttrue' ]]; then
+            echo "Refusing to overwrite an already published release."
+            exit 1
+          fi
+          gh release upload "$tag" "$main" "$mod" "$RELEASE_DIR/latest.json" --clobber
+          gh api "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/release-list.json"
+          node <<'NODE'
+          const fs = require('fs'), crypto = require('crypto');
+          const release = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/release-list.json')).find(r => r.tag_name === 'v' + process.env.VERSION);
+          if (!release?.draft || release.prerelease) throw new Error('Release must remain a draft until verified');
+          const dir = process.env.RELEASE_DIR;
+          const names = [`ITAYOS.Setup.${process.env.VERSION}.exe`, `ITAYOS.Mod.Setup.${process.env.VERSION}.exe`, 'latest.json'];
+          if (release.assets.length !== names.length) throw new Error('Unexpected assets in public release');
+          for (const name of names) {
+            const bytes = fs.readFileSync(dir + '/' + name);
+            const sha = 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex');
+            const asset = release.assets.find(a => a.name === name);
+            if (!asset || asset.state !== 'uploaded' || asset.size !== bytes.length || asset.digest !== sha) throw new Error('Uploaded file failed integrity check: ' + name);
+          }
+          NODE
+          gh release edit "$tag" --draft=false --latest
