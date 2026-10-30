@@ -6,6 +6,11 @@ on:
         description: Installer version (X.Y.Z)
         required: true
         default: '1.2.0'
+      publish:
+        description: Publish immediately (otherwise prepare a draft for the app administrator)
+        required: true
+        type: boolean
+        default: false
 permissions:
   contents: write
 concurrency:
@@ -21,6 +26,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
         shell: bash
         run: |
           set -euo pipefail
@@ -65,4 +71,8 @@ jobs:
             if (!asset || asset.state !== 'uploaded' || asset.size !== bytes.length || asset.digest !== sha) throw new Error('Uploaded file failed integrity check: ' + name);
           }
           NODE
-          gh release edit "$tag" --draft=false --latest
+          if [[ "$PUBLISH" == "true" ]]; then
+            gh release edit "$tag" --draft=false --latest
+          else
+            echo "Draft is ready for the administrator's publish button."
+          fi
